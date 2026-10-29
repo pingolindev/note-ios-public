@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>$(DEVELOPMENT_LANGUAGE)</string>
+    <key>CFBundleDisplayName</key>
+    <string>Note</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>$(PRODUCT_NAME)</string>
+    <key>CFBundlePackageType</key>
+    <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$(MARKETING_VERSION)</string>
+    <key>CFBundleVersion</key>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <false/>
+    </dict>
+    <!-- `fetch` is required by BGAppRefreshTask, which is what Polling push
+         mode schedules (PollingPushManager, BGAppRefreshTaskRequest).
+         `processing` covers BGProcessingTask only, so without this entry
+         BGTaskScheduler.submit throws and PollingPushManager.scheduleNext
+         catches the error and returns — leaving Settings promising a refresh
+         "typically every 15 min – 1 h" that could never run. The task
+         identifiers themselves are in BGTaskSchedulerPermittedIdentifiers
+         below; both halves are needed. -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>remote-notification</string>
+        <string>processing</string>
+        <string>fetch</string>
+    </array>
+    <key>UILaunchScreen</key>
+    <dict>
+        <key>UIColorName</key>
+        <string>LaunchScreenBackground</string>
+        <key>UIImageName</key>
+        <string>LaunchScreenIcon</string>
+    </dict>
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>arm64</string>
+    </array>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>NSFaceIDUsageDescription</key>
+    <string>Use Face ID to unlock Note and keep your notes secure.</string>
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array>
+        <string>com.pingolin.note.refresh</string>
+        <string>com.pingolin.note.sync</string>
+    </array>
+    <!-- EXPORT COMPLIANCE — answered here so every upload self-complies.
+         The app ships XChaCha20-Poly1305, X25519, Argon2id and BLAKE3 via the
+         Rust mobile SDK. The yearly self-classification report to BIS (ECCN
+         5D992.c, mass-market exemption) is separate; Apple's flag below does
+         not change that.
+
+         `false` declares that the app uses no non-exempt encryption, so there
+         is no declaration or compliance code to attach. Without the key, every
+         build stalls on the export-compliance question.
+
+         Never set this to `true` without an ITSEncryptionExportComplianceCode
+         beside it: with `true` and no approved declaration on the app record,
+         altool refuses the upload outright ("Invalid Export Compliance Code",
+         iris-code 90592). -->
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>CFBundleURLName</key>
+            <string>com.pingolin.note.deeplink</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>noteapp</string>
+            </array>
+        </dict>
+    </array>
+    <!-- App-Bound Domains. Without this WebKit disables service workers in
+         WKWebView outright: `navigator.serviceWorker` is simply absent, so
+         the offline shell that the Note web editor ships (its service worker)
+         never registers and a cold offline open keeps landing on the retry
+         view. The list is every host the shell is allowed to NAVIGATE to
+         in-view — the note origin, and the account portal that WebShellView
+         lets through (bar /subscription and /payment, which go to Safari).
+         API hosts are not navigations and need no entry. Ten entries maximum;
+         four used. Pairs with `limitsNavigationsToAppBoundDomains` in
+         WebShellView. -->
+    <key>WKAppBoundDomains</key>
+    <array>
+        <string>note.pingolin.com</string>
+        <string>note.pingolindev.com</string>
+        <string>account.pingolin.com</string>
+        <string>account.pingolindev.com</string>
+    </array>
+</dict>
+</plist>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>app-store-connect</string>
+
+    <key>signingStyle</key>
+    <string>automatic</string>
+
+    <!-- teamID is the Apple Developer Team ID. archive.sh substitutes
+         it at export time (PlistBuddy); the checked-in file keeps a
+         placeholder so it is self-contained. -->
+    <key>teamID</key>
+    <string>$(DEVELOPMENT_TEAM)</string>
+
+    <!-- Symbols are required for App Store Connect to symbolicate
+         crash reports + power-impact reports. -->
+    <key>uploadSymbols</key>
+    <true/>
+
+    <!-- Bitcode is deprecated (Xcode 14 and later). -->
+    <key>uploadBitcode</key>
+    <false/>
+
+    <!-- Strip Swift symbols off the .ipa before upload so the binary
+         is smaller and reverse-engineering is mildly harder. Re-uploads
+         the unstripped dSYMs separately so symbolication still works. -->
+    <key>stripSwiftSymbols</key>
+    <true/>
+
+    <!-- Write the IPA to disk; archive.sh uploads it separately
+         when App Store Connect credentials are set. -->
+    <key>destination</key>
+    <string>export</string>
+</dict>
+</plist>

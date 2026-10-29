@@ -1,0 +1,192 @@
+name: Note
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  bundleIdPrefix: com.pingolin
+  developmentLanguage: en
+  xcodeVersion: "26.0"
+
+# Build configurations. ReleaseDev is a Release-optimised, App
+# Store-signed build whose hosts are compiled to the DEVELOPMENT
+# environment, so TestFlight builds can run against it. The choice is
+# made at compile time (SWIFT_ACTIVE_COMPILATION_CONDITIONS below),
+# never at runtime, so a Release build has no runtime environment
+# switch. Plain Release stays pinned to production.
+configs:
+  Debug: debug
+  Release: release
+  ReleaseDev: release
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    MARKETING_VERSION: "1.0.3"
+    CURRENT_PROJECT_VERSION: "8"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: NO
+  configs:
+    ReleaseDev:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: RELEASE_DEV
+
+packages:
+  PingolinNoteSDK:
+    path: .
+  Sodium:
+    url: https://github.com/jedisct1/swift-sodium
+    revision: cfd195c76882aa9b997560ca7cb95d72fbf5db00
+  # GRDB with SQLCipher for the encrypted local read cache (offline
+  # support). Upstream groue/GRDB.swift ships only the system SQLite via SPM
+  # (no encryption); the DuckDuckGo GRDB.swift package distributes a prebuilt
+  # GRDB.xcframework compiled against SQLCipher (SQLITE_HAS_CODEC) consumable
+  # via SPM — the standard SPM route for `pod 'GRDB.swift/SQLCipher'`. Pinned
+  # to the checksum-locked 3.0.0 binary release. Product name: GRDB.
+  GRDB:
+    url: https://github.com/duckduckgo/GRDB.swift
+    revision: 46098847eeabdb008f238bef5750a8e64097b6ed
+
+targets:
+  Note:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes:
+          - "Info.plist"
+      - path: Shared
+      # Third-party notices, shown offline under Settings → About → Open Source
+      # Licenses: this app's own dependencies, and the Rust crates linked into
+      # the SDK framework (build-ios.sh copies the SDK's inventory next to the
+      # bindings, so it changes whenever they do). Listed as sources with a
+      # resources build phase: XcodeGen has no target-level `resources:` key and
+      # ignores it.
+      - path: THIRD_PARTY_LICENSES.md
+        buildPhase: resources
+      - path: Sources/PingolinNoteSDK/THIRD_PARTY_LICENSES-mobile-sdk.md
+        buildPhase: resources
+      # The app's privacy manifest, copied to the root of Note.app. Listed the
+      # same way as the notices above, for the same reason.
+      - path: PrivacyInfo.xcprivacy
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pingolin.note
+        PRODUCT_NAME: Note
+        # iPhone only. Note has no iPad interface — no size classes,
+        # no split view, no idiom branches anywhere in App/ — so the
+        # iPad build is the phone layout stretched across a 13"
+        # canvas: the logo marooned in white and the sign-in form
+        # spread edge to edge. Shipping that invites an App Review
+        # 2.1 rejection and obliges a 2064x2752 screenshot set for a
+        # surface nobody has tested. Unlike Track there is no `gps`
+        # capability filtering iPads out, so this is the only thing
+        # that stops one installing it.
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        INFOPLIST_FILE: App/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_PREVIEWS: YES
+        SWIFT_STRICT_CONCURRENCY: minimal
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: Note.entitlements
+        Release:
+          CODE_SIGN_ENTITLEMENTS: Note.Release.entitlements
+        # Distribution-signed like Release (production APNs + App Attest
+        # entitlements are what the App Store profile carries); only the
+        # compiled-in hosts differ. See the project-level `configs:` note.
+        ReleaseDev:
+          CODE_SIGN_ENTITLEMENTS: Note.Release.entitlements
+    dependencies:
+      - package: PingolinNoteSDK
+        product: PingolinNoteSDK
+      - package: Sodium
+        product: Sodium
+      - package: GRDB
+        product: GRDB
+      - target: NoteShareExt
+      - target: NoteWidgets
+
+  NoteShareExt:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NoteShareExt
+        excludes:
+          - "Info.plist"
+          - "PrivacyInfo.xcprivacy"
+      - path: Shared
+      # The extension's own privacy manifest, at the root of the .appex: its
+      # code (Shared/SharedAppGroup.swift) reads the app group's UserDefaults.
+      # Listed explicitly (and excluded from the folder above) so it is a
+      # resource whatever XcodeGen's default for the type.
+      - path: NoteShareExt/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pingolin.note.share
+        PRODUCT_NAME: NoteShareExt
+        # iPhone only, matching the host app: an app extension must not claim a
+        # wider device family than the app that contains it.
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        INFOPLIST_FILE: NoteShareExt/Info.plist
+        CODE_SIGN_ENTITLEMENTS: NoteShareExt/NoteShareExt.entitlements
+        SWIFT_STRICT_CONCURRENCY: minimal
+
+  NoteWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NoteWidgets
+        excludes:
+          - "Info.plist"
+          - "PrivacyInfo.xcprivacy"
+      - path: Shared
+      # The extension's own privacy manifest, as for NoteShareExt above.
+      - path: NoteWidgets/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pingolin.note.widgets
+        PRODUCT_NAME: NoteWidgets
+        # iPhone only, matching the host app: an app extension must not claim a
+        # wider device family than the app that contains it.
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        INFOPLIST_FILE: NoteWidgets/Info.plist
+        CODE_SIGN_ENTITLEMENTS: NoteWidgets/NoteWidgets.entitlements
+        SWIFT_STRICT_CONCURRENCY: minimal
+
+  NoteTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests/NoteTests
+    settings:
+      base:
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Note.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Note"
+    dependencies:
+      - target: Note
+      - package: PingolinNoteSDK
+        product: PingolinNoteSDK
+
+  NoteUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - Tests/NoteUITests
+    settings:
+      base:
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Note
+    dependencies:
+      - target: Note
