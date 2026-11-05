@@ -69,7 +69,7 @@ final class WebAppDeviceStateTests: XCTestCase {
         XCTAssertEqual(sections?["account"], "account")
     }
 
-    func testAccountDeletionIsTaggedAccountAndNotSomethingElse() {
+    func testManageRowStillOpensAccountAndDeleteIsTaggedAccount() {
         // `account` is the ONE section id the PAGE reads rather than echoes:
         // the web editor's SettingsPanel filters it out of the Device list
         // and renders it under the Account heading. Tag account deletion as
@@ -79,7 +79,9 @@ final class WebAppDeviceStateTests: XCTestCase {
         // near-miss ("accounts", "diagnostics") still renders a row, still
         // opens the right sheet, and is silently in the wrong place.
         let rows = WebAppDeviceState.snapshot(device())["rows"] as? [[String: String]]
-        XCTAssertEqual(rows?.first(where: { $0["id"] == "account" })?["section"], "account")
+        let account = rows?.first(where: { $0["id"] == "account" })
+        XCTAssertEqual(account?["label"], "Manage")
+        XCTAssertEqual(account?["section"], "account")
     }
 
     // MARK: - Values
@@ -137,6 +139,19 @@ final class WebAppDeviceStateTests: XCTestCase {
         XCTAssertNotNil(guardIndex)
         XCTAssertNotNil(assignIndex)
         XCTAssertTrue(guardIndex! < assignIndex!, "the assignment runs before the guard")
+    }
+
+    func testTheAccountEventIsOriginGuardedFirst() {
+        let script = WebShellModel.accountEventScript(origin: "https://note.pingolindev.com")
+        XCTAssertTrue(script.hasPrefix(#"(function(){try{if(location.origin!=="https://note.pingolindev.com")return;"#),
+                      script)
+        // The page listens on the document (note ui lib/accountRecheck.ts).
+        XCTAssertTrue(script.contains("document.dispatchEvent(new CustomEvent('pingolin-account'))"), script)
+    }
+
+    func testTheAccountEventEscapesTheOrigin() {
+        let script = WebShellModel.accountEventScript(origin: #"https://a"b"#)
+        XCTAssertTrue(script.contains(#"location.origin!=="https://a\"b""#), script)
     }
 
     func testOriginIsEscapedRatherThanInterpolatedRaw() {

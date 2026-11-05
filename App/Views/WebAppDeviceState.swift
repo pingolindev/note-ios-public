@@ -142,14 +142,14 @@ enum WebAppDeviceState {
         // renders it beneath "These are set on this device", which is wrong
         // about what the button does.
         // Five rows, matching the Android app's `WebAppDeviceState` contract
-        // exactly. Only the VALUES differ, because only the values are platform
-        // facts.
+        // exactly. Values and user-facing wording may differ where they are
+        // platform facts; the row id and section remain the shared contract.
         let rows: [[String: String]] = [
             row(id: "security", label: "Security", value: "", section: sectionSecurity),
             row(id: "push", label: "Push delivery", value: push, section: sectionNotifications),
             row(id: "about", label: "About", value: device.appVersion, section: sectionAbout),
             row(id: "diagnostics", label: "Diagnostics", value: "", section: sectionDiagnostics),
-            row(id: "account", label: "Account", value: "", section: sectionAccount),
+            row(id: "account", label: "Manage", value: "", section: sectionAccount),
         ]
 
         return [

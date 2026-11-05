@@ -453,6 +453,27 @@ final class WebShellModel: NSObject, ObservableObject {
         webView.evaluateJavaScript(IdentityRecheck.pageEventScript(origin: origin))
     }
 
+    /// The purchase sheet closed, so the plan the page shows may be out of
+    /// date. The page asks `/auth/me` at once instead of at its next minute: a
+    /// SwiftUI sheet opens in the same scene, so closing one posts no
+    /// foreground notification and fires no `visibilitychange`.
+    ///
+    /// A page too old to listen ignores the event, and a build without this
+    /// call leaves the page to its minute timer, so the two ship in any order.
+    @MainActor
+    func notifyAccountMayHaveChanged() {
+        guard let webView else { return }
+        webView.evaluateJavaScript(Self.accountEventScript(origin: origin))
+    }
+
+    /// The origin guard sits inside the script, as in `IdentityRecheck`'s:
+    /// `evaluateJavaScript` has no allowlist, and the account portal renders
+    /// in this web view too.
+    nonisolated static func accountEventScript(origin: String) -> String {
+        "(function(){try{if(location.origin!==\(WebAppDeviceState.quote(origin)))return;"
+            + "document.dispatchEvent(new CustomEvent('pingolin-account'));}catch(e){}})();"
+    }
+
     /// `https://note.pingolin.com` -> `.pingolin.com`, matching the cookie
     /// domain the server sets, so the cookie also covers `account.` for the
     /// client-key handoff. The port must not survive into the domain — a
@@ -957,6 +978,9 @@ struct WebShellView: View {
             // Clear it, for the same reason settingsSection is cleared: a later
             // generic Upgrade tap must not inherit the last 402's framing.
             model.premiumFocus = nil
+            // `buy` closes this sheet only after the server has the purchase,
+            // so the page's plan row can turn as it comes back into view.
+            model.notifyAccountMayHaveChanged()
         }) {
             PremiumSheet(focus: model.premiumFocus)
         }
