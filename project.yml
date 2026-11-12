@@ -22,7 +22,7 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
-    MARKETING_VERSION: "1.0.5"
+    MARKETING_VERSION: "1.0.6"
     CURRENT_PROJECT_VERSION: "8"
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: NO
@@ -108,6 +108,58 @@ targets:
         product: GRDB
       - target: NoteShareExt
       - target: NoteWidgets
+      - target: NotificationExtension
+
+  # Runs for the note server's one visible alert, `finish_shares` ("Someone
+  # you invited has joined Pingolin."), even when the app was swiped away:
+  # finishes the shares the owner's invitation left and says on the banner who
+  # can now open what. Runs only because the server sends that alert with
+  # mutable-content.
+  NotificationExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NotificationExtension
+        excludes:
+          - "Info.plist"
+          - "PrivacyInfo.xcprivacy"
+      # The finisher's rules and stores, compiled from the app's own files —
+      # never a second copy: which shares, whom to trust, the request, the
+      # app-group stores the app writes and the lock both processes take.
+      - path: App/Finisher
+      # The app's Keychain items, read through its keychain group (and the
+      # session's two items updated after a refresh).
+      - path: App/Services/KeychainService.swift
+      # An account's id in its one form, compared the app's way.
+      - path: App/Services/CanonicalId.swift
+      # Its sessions refuse the leaked emSign keys as the app's do: one list.
+      - path: App/Services/TrustBlocklist.swift
+      # Whether the banner may show an address.
+      - path: App/Services/EmailFormat.swift
+      # The extension's own privacy manifest, at the root of the .appex: its
+      # code reads the app group's UserDefaults, and the SDK it links reads
+      # file metadata. Listed explicitly (and excluded from the folder above)
+      # so it is a resource whatever XcodeGen's default for the type.
+      - path: NotificationExtension/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pingolin.note.NotificationExtension
+        PRODUCT_NAME: NotificationExtension
+        # iPhone only, matching the host app: an app extension must not claim a
+        # wider device family than the app that contains it.
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        INFOPLIST_FILE: NotificationExtension/Info.plist
+        # The app's keychain group (the keys and the session) and its app
+        # group. See NotificationExtension.entitlements.
+        CODE_SIGN_ENTITLEMENTS: NotificationExtension/NotificationExtension.entitlements
+        SWIFT_STRICT_CONCURRENCY: minimal
+    dependencies:
+      # Seals and signs exactly as the page does (sealForRecipient,
+      # signNoteShareWrap), and opens the note's key with the vault key.
+      - package: PingolinNoteSDK
+        product: PingolinNoteSDK
 
   NoteShareExt:
     type: app-extension
@@ -165,6 +217,15 @@ targets:
     platform: iOS
     sources:
       - Tests/NoteTests
+      # The notification extension's own files are compiled into the test
+      # bundle as well as into the .appex: an app-extension target cannot be
+      # @testable-imported. The rules they share with the app (App/Finisher)
+      # are NOT compiled in here: the tests reach them through the app module,
+      # so both sides use the one copy of each type.
+      - path: NotificationExtension/NotificationService.swift
+      - path: NotificationExtension/BackgroundFinish.swift
+      - path: NotificationExtension/ExtensionSessionRefresh.swift
+      - path: NotificationExtension/ExtensionPreviousVaultKeys.swift
     settings:
       base:
         IPHONEOS_DEPLOYMENT_TARGET: "17.0"
@@ -172,6 +233,9 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         BUNDLE_LOADER: "$(TEST_HOST)"
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Note.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Note"
+        # The extension's files compiled in above import the app module only
+        # here (`#if NOTE_TESTS`), where it exists.
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) NOTE_TESTS"
     dependencies:
       - target: Note
       - package: PingolinNoteSDK

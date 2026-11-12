@@ -38,6 +38,21 @@ final class PushRoutingTests: XCTestCase {
         XCTAssertEqual(PushNotificationManager.event(from: dispatched("notebook_share")), .notebookShare(refId: shareId))
         XCTAssertEqual(PushNotificationManager.event(from: dispatched("sync")), .sync)
         XCTAssertEqual(PushNotificationManager.event(from: dispatched("reminder")), .reminder)
+        XCTAssertEqual(PushNotificationManager.event(from: dispatched("identities")), .identities)
+        XCTAssertEqual(PushNotificationManager.event(from: dispatched("finish_shares")), .finishShares)
+    }
+
+    /// `finish_shares` reaches iOS as a VISIBLE alert with mutable-content (the
+    /// notification extension runs for it), the tickle's fields beside `aps`.
+    func testTheFinishSharesAlertIsRoutedToTheFinisher() {
+        let alert: [AnyHashable: Any] = [
+            "aps": ["alert": ["title": "Pingolin Note", "body": "Someone you invited has joined Pingolin."],
+                    "mutable-content": 1],
+            "type": "tickle", "kind": "finish_shares", "refId": "00000000-0000-0000-0000-000000000000",
+        ]
+        XCTAssertEqual(PushNotificationManager.event(from: alert), .finishShares)
+        XCTAssertTrue(FinishPush.isFinishShares(alert))
+        XCTAssertFalse(FinishPush.isFinishShares(dispatched("sync")))
     }
 
     func testTypeOnlyCoversASenderWithoutAKind() {

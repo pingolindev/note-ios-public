@@ -98,10 +98,16 @@ final class WidgetSessionTests: XCTestCase {
         // false over the initial false, and still clears a flag left true.
         XCTAssertTrue(auth.contains("        didSet { Self.publishSignedIn(isAuthenticated) }\n"),
                       "every set of the session publishes the flag")
+        // The same publish tells the notification extension which account is
+        // signed in here (`FinisherBridge`), and none once nobody is.
         XCTAssertTrue(auth.contains(
             "    static func publishSignedIn(_ signedIn: Bool) {\n" +
                 "        SharedAppGroup.isSignedIn = signedIn\n" +
                 "        WidgetCenter.shared.reloadAllTimelines()\n" +
+                "        let config = AppConfiguration.shared\n" +
+                "        FinisherBridge.publish(\n" +
+                "            account: signedIn ? KeychainService.shared.getString(for: .userId) : nil,\n" +
+                "            apiBase: config.apiBaseURL, authBase: config.authBaseURL, detail: config.notificationDetail.rawValue)\n" +
                 "    }\n"
         ))
     }

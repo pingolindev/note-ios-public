@@ -261,7 +261,11 @@ final class AppConfiguration {
                 rawValue: defaults.string(forKey: notificationDetailKey) ?? ""
             ) ?? .titles
         }
-        set { defaults.set(newValue.rawValue, forKey: notificationDetailKey) }
+        set {
+            defaults.set(newValue.rawValue, forKey: notificationDetailKey)
+            // The notification extension's banner follows it (`FinishBanner`).
+            FinisherBridge.publishDetail(newValue.rawValue)
+        }
     }
 
     var authBaseURL: String { environment.authBaseURL }

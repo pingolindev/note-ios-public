@@ -57,15 +57,15 @@ final class ServiceWorkersAtLaunchTests: XCTestCase {
         _ = delegate
     }
 
-    /// The first load waits for the removal: the shell's first task removes the workers, then seeds the cookie, then
-    /// loads. The removal is of the registrations only, from the shell's own store, once per launch.
+    /// The first load waits for the removal: the shell's first task removes the workers, then holds the load for the
+    /// launch's refresh, which seeds the cookie, then loads (`FirstLoadTests`). The removal is of the registrations
+    /// only, from the shell's own store, once per launch.
     func testTheFirstLoadWaitsForTheRemoval() throws {
         let shell = try source("App/Views/WebShellView.swift")
         XCTAssertTrue(shell.contains("""
                 Task { @MainActor [weak self] in
                     await self?.removeServiceWorkersOnce()
-                    await self?.seedCookies()
-                    self?.loadHome()
+                    await self?.holdFirstLoadForTheLaunchRefresh()
                 }
         """), "removed before the first load")
         XCTAssertTrue(shell.contains("""

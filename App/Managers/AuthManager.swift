@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Pingolin Note. If not, see <https://www.gnu.org/licenses/>.
 
+import CryptoKit
 import Foundation
 import os
 import PingolinNoteSDK
@@ -34,10 +35,16 @@ final class AuthManager: ObservableObject {
     private static let keysLog = Logger(subsystem: "com.pingolin.note", category: "keys")
 
     /// Tell the widgets whether anybody is signed in, and have them
-    /// redraw: signed out they read and show no note.
+    /// redraw: signed out they read and show no note. Tell the notification
+    /// extension too, which finishes shares only for the account signed in
+    /// here, against the hosts the app uses (`FinisherBridge`).
     static func publishSignedIn(_ signedIn: Bool) {
         SharedAppGroup.isSignedIn = signedIn
         WidgetCenter.shared.reloadAllTimelines()
+        let config = AppConfiguration.shared
+        FinisherBridge.publish(
+            account: signedIn ? KeychainService.shared.getString(for: .userId) : nil,
+            apiBase: config.apiBaseURL, authBase: config.authBaseURL, detail: config.notificationDetail.rawValue)
     }
 
     @Published private(set) var isAuthenticated = false {
@@ -237,7 +244,7 @@ final class AuthManager: ObservableObject {
             // network + full re-login. As in the Track iOS app: trust the stored
             // access token and proceed offline (currentUser stays nil; the UI
             // renders against cached data until reconnected).
-            if let apiError = error as? APIError, apiError.status == 401 {
+            if Self.launchCheckEndsSession(error) {
                 // Session EXPIRY, not an explicit sign-out: the stored token is
                 // definitively dead, but the user did NOT ask to log out — so we
                 // must NOT run the full logout() wipe, which would destroy their
@@ -1237,6 +1244,55 @@ final class AuthManager: ObservableObject {
         expireSession()
     }
 
+    /// Which session a refresh started under: the account, and the refresh
+    /// token it presents (a digest, so no second copy of the token). A refusal
+    /// that comes back under another stamp is about a session already gone.
+    struct SessionStamp: Equatable {
+        let account: String?
+        let refreshToken: SHA256.Digest?
+
+        static func current(_ keychain: KeychainService = .shared) -> SessionStamp {
+            SessionStamp(account: CanonicalId.of(keychain.getString(for: .userId)),
+                         refreshToken: keychain.getString(for: .refreshToken).map { SHA256.hash(data: Data($0.utf8)) })
+        }
+    }
+
+    /// Set while a sign-out or an erasure is under way: a refusal landing
+    /// meanwhile is that end's, never an expiry over it.
+    private var endingSession = false
+
+    /// The auth server refused a refresh started under `stamp`
+    /// (`RefreshOutcome.refused`): the session is over. Ends it like an
+    /// expiry, so the web shell loads nothing and the person signs in here,
+    /// never on the account portal (`refusalEndsSession`). Answers whether it
+    /// did: a refusal it drops (a sign-out or erasure under way, another
+    /// session meanwhile) leaves the caller to carry on as for no answer.
+    @discardableResult
+    func expireSessionRefusedByServer(since stamp: SessionStamp) -> Bool {
+        guard Self.refusalEndsSession(isAuthenticated: isAuthenticated, endingSession: endingSession,
+                                      startedUnder: stamp, now: .current(keychain)) else { return false }
+        expireSession()
+        return true
+    }
+
+    /// Whether a refusal ends the session: only one still signed in, with no
+    /// sign-out or erasure under way (its own end, which empties the page's
+    /// website data, stands; an expiry over it would keep that data), and
+    /// still the session the refresh presented (not after a sign-out or
+    /// another sign-in).
+    nonisolated static func refusalEndsSession(isAuthenticated: Bool, endingSession: Bool,
+                                               startedUnder: SessionStamp, now: SessionStamp) -> Bool {
+        isAuthenticated && !endingSession && startedUnder == now
+    }
+
+    /// Whether the launch's `/auth/me` failure ends the session: only a 401
+    /// that stood after the refresh (`APIService.execute` lets a 401 through
+    /// only when the refresh was refused). A refresh that got no answer
+    /// (`APIError.refreshNoAnswer`) and every other failure keep it.
+    nonisolated static func launchCheckEndsSession(_ error: Error) -> Bool {
+        (error as? APIError)?.status == 401
+    }
+
     /// Whether a two-factor challenge offering `availableMethods` can be
     /// answered here: this app has a 6-digit code entry only, i.e. TOTP. nil
     /// (a server that lists no methods) keeps the code entry.
@@ -1433,6 +1489,11 @@ final class AuthManager: ObservableObject {
         forfeitCreditBalance: Bool = false
     ) async throws -> DeleteAccountResponse {
         let token = try await reauthenticate(password: password)
+        // The erasure revokes this session on the server: a refusal that a
+        // refresh still out brings back is the erasure's, never an expiry that
+        // would keep the page's website data.
+        endingSession = true
+        defer { endingSession = false }
         let result = try await api.deleteAccount(
             reauthToken: token,
             forfeitCreditBalance: forfeitCreditBalance
@@ -1547,6 +1608,10 @@ final class AuthManager: ObservableObject {
     // MARK: - Logout
 
     func logout(ending: SessionEnd = .signedOut) async {
+        // From here a refusal brought back by a refresh still out is this
+        // end's, never an expiry over it (`expireSessionRefusedByServer`).
+        endingSession = true
+        defer { endingSession = false }
         sessionEnd = ending
         // The page's last keep of its kept trust, before anything below
         // deletes `.userId` or a key: switchAccountCleanup takes the sharing key

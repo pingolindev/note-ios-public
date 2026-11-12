@@ -16,6 +16,7 @@
 // along with Pingolin Note. If not, see <https://www.gnu.org/licenses/>.
 
 import Foundation
+import UIKit
 import os
 
 actor APIService {
@@ -681,12 +682,22 @@ actor APIService {
         if http.statusCode == 401, !didRefresh,
            req.value(forHTTPHeaderField: "Authorization") != nil,
            req.url?.path != "/api/v1/auth/refresh" {
-            if await tryRefreshAccessToken() {
+            switch await tryRefreshAccessToken() {
+            case .refreshed:
                 var retried = req
                 if let newToken = keychain.getString(for: .accessToken) {
                     retried.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
                 }
                 return try await execute(retried, attempt: attempt, didRefresh: true)
+            case .refused:
+                // The session is over: this 401 stands, and a caller that ends
+                // a session on a 401 ends this one.
+                break
+            case .noAnswer:
+                // Nothing was learnt about the session (no network, a 5xx, the
+                // refresh lock's wait running out): never the 401 that would
+                // end it. It fails as the network trouble it is.
+                throw APIError.refreshNoAnswer
             }
         }
 
@@ -700,41 +711,115 @@ actor APIService {
             if http.statusCode == 402, req.url?.path != "/api/v1/quota" {
                 Task { @MainActor in QuotaManager.shared.refresh() }
             }
-            // Server envelope: {success, data, error: String?, error_code: String?}
-            // (matches android Dtos.kt). Pull the human-readable error
-            // string and error_code out and synthesize an APIError.
-            if let wrapped = try? decoder.decode(APIResponse<EmptyResponse>.self, from: data),
-               let msg = wrapped.error {
-                throw APIError(code: wrapped.errorCode ?? "http_\(http.statusCode)", message: msg,
-                               status: http.statusCode, quota: wrapped.quota)
-            }
-            #if DEBUG
-            let preview = String(data: data.prefix(400), encoding: .utf8) ?? "<binary>"
-            throw APIError(code: "http_\(http.statusCode)", message: "Request failed: \(preview)", status: http.statusCode)
-            #else
-            throw APIError(code: "http_\(http.statusCode)", message: "Request failed", status: http.statusCode)
-            #endif
+            throw Self.httpError(status: http.statusCode,
+                                 contentType: http.value(forHTTPHeaderField: "Content-Type"),
+                                 body: data, decoder: decoder)
         }
         return try Self.decodeSuccessBody(data, using: decoder)
+    }
+
+    /// The error for an HTTP answer outside 2xx. Server envelope: {success,
+    /// data, error: String?, error_code: String?} (matches android Dtos.kt):
+    /// the human-readable error string and error_code are pulled out; without
+    /// one, an `http_<status>` is synthesized. `isJSON` keeps whether the
+    /// answer said it was JSON, which is what tells the auth server's own
+    /// refusal from an edge's or a proxy's page (`RefreshOutcome`).
+    nonisolated static func httpError(status: Int, contentType: String?, body data: Data,
+                                      decoder: JSONDecoder) -> APIError {
+        let isJSON = (contentType ?? "").lowercased().contains("application/json")
+        if let wrapped = try? decoder.decode(APIResponse<EmptyResponse>.self, from: data),
+           let msg = wrapped.error {
+            return APIError(code: wrapped.errorCode ?? "http_\(status)", message: msg,
+                            status: status, quota: wrapped.quota, isJSON: isJSON)
+        }
+        #if DEBUG
+        let preview = String(data: data.prefix(400), encoding: .utf8) ?? "<binary>"
+        return APIError(code: "http_\(status)", message: "Request failed: \(preview)", status: status, isJSON: isJSON)
+        #else
+        return APIError(code: "http_\(status)", message: "Request failed", status: status, isJSON: isJSON)
+        #endif
     }
 
     /// Refresh the access token now if it expires within `seconds` (or its
     /// expiry cannot be read). For the web shell, which hands the page a copy
     /// of the access token and no refresh token, so the page can never
-    /// refresh it itself. Returns false only when a needed refresh failed.
+    /// refresh it itself. `.refreshed` when the stored token has the time
+    /// asked for, refreshed or not; `.noAnswer` when none is stored.
     @discardableResult
-    func refreshAccessTokenIfExpiring(within seconds: TimeInterval) async -> Bool {
-        guard let token = keychain.getString(for: .accessToken) else { return false }
+    func refreshAccessTokenIfExpiring(within seconds: TimeInterval) async -> RefreshOutcome {
+        guard let token = keychain.getString(for: .accessToken) else { return .noAnswer }
         if let expiry = Self.accessTokenExpiry(token), expiry.timeIntervalSinceNow > seconds {
-            return true
+            return .refreshed
         }
         return await tryRefreshAccessToken()
+    }
+
+    /// What the app checks on its way back to the foreground, once per trip:
+    /// a token near its expiry is refreshed, as above; a fresh one is asked
+    /// about once (`probeSession`), because a session revoked elsewhere is
+    /// otherwise noticed natively only near expiry, after the page's own
+    /// re-check has landed on the portal. The probe's JSON 401 goes through
+    /// the one refresher, whose answer says whether the session is over.
+    func checkSessionOnReturn(within seconds: TimeInterval) async -> RefreshOutcome {
+        guard let token = keychain.getString(for: .accessToken) else { return .noAnswer }
+        let fresh = Self.accessTokenExpiry(token).map { $0.timeIntervalSinceNow > seconds } ?? false
+        return await Self.sessionCheck(fresh: fresh,
+                                       probe: { await self.probeSession() },
+                                       refresh: { await self.tryRefreshAccessToken() })
+    }
+
+    /// What one `GET /auth/me` said about the session.
+    enum SessionProbe: Equatable {
+        case alive
+        /// The auth server's JSON 401: this token isn't taken.
+        case unauthorized
+        /// Anything else: no network, a 5xx, an edge's page.
+        case noAnswer
+    }
+
+    /// `checkSessionOnReturn`'s rule (`SessionOnReturnTests`).
+    static func sessionCheck(fresh: Bool, probe: () async -> SessionProbe,
+                             refresh: () async -> RefreshOutcome) async -> RefreshOutcome {
+        guard fresh else { return await refresh() }
+        switch await probe() {
+        case .alive: return .refreshed
+        case .unauthorized: return await refresh()
+        case .noAnswer: return .noAnswer
+        }
+    }
+
+    /// `GET /auth/me` with the stored token, WITHOUT the refresh `execute`
+    /// runs on a 401 (`didRefresh: true`): the caller puts that 401 through
+    /// the refresher itself and reads its answer.
+    private func probeSession() async -> SessionProbe {
+        do {
+            var req = URLRequest(url: URL(string: config.authBaseURL + "/api/v1/auth/me")!)
+            req.httpMethod = "GET"
+            try addHeaders(to: &req, auth: true)
+            let _: MeResponse = try await execute(req, didRefresh: true)
+            return .alive
+        } catch let error as APIError where error.status == 401 && error.isJSON == true {
+            return .unauthorized
+        } catch {
+            return .noAnswer
+        }
     }
 
     /// The `exp` claim of a JWT access token, or nil when it cannot be read.
     /// No signature check: this only decides WHEN to refresh; the server still
     /// decides whether a token is valid.
     nonisolated static func accessTokenExpiry(_ jwt: String) -> Date? {
+        jwtDate(jwt, claim: "exp")
+    }
+
+    /// The `iat` claim of a JWT access token (when it was issued), or nil when
+    /// it cannot be read. Orders two tokens: an older one never replaces a
+    /// newer one in the page's cookie jar.
+    nonisolated static func accessTokenIssuedAt(_ jwt: String) -> Date? {
+        jwtDate(jwt, claim: "iat")
+    }
+
+    private nonisolated static func jwtDate(_ jwt: String, claim: String) -> Date? {
         let parts = jwt.split(separator: ".")
         guard parts.count == 3 else { return nil }
         var b64 = String(parts[1]).replacingOccurrences(of: "-", with: "+")
@@ -742,9 +827,9 @@ actor APIService {
         while b64.count % 4 != 0 { b64 += "=" }
         guard let data = Data(base64Encoded: b64),
               let claims = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let exp = claims["exp"] as? NSNumber
+              let seconds = claims[claim] as? NSNumber
         else { return nil }
-        return Date(timeIntervalSince1970: exp.doubleValue)
+        return Date(timeIntervalSince1970: seconds.doubleValue)
     }
 
     /// Remove auth cookies an earlier build's cookie-accepting session stored
@@ -764,50 +849,140 @@ actor APIService {
     }
 
     /// Single-flight refresh. Reads the stored refresh token, calls
-    /// `/auth/refresh`, persists the new pair, and returns true on
-    /// success. Returns false (and logs the server's reason)
-    /// on failure so the caller can fall through to a logout.
-    private var refreshInFlight: Task<Bool, Never>?
+    /// `/auth/refresh`, persists the new pair, and answers what it came to
+    /// (`RefreshOutcome`; failures log the server's reason). Only `.refused`
+    /// lets a caller fall through to ending the session.
+    private var refreshInFlight: Task<RefreshOutcome, Never>?
 
-    private func tryRefreshAccessToken() async -> Bool {
+    private func tryRefreshAccessToken() async -> RefreshOutcome {
         if let inFlight = refreshInFlight {
             return await inFlight.value
         }
-        let task = Task<Bool, Never> { [weak self] in
-            guard let self else { return false }
+        let task = Task<RefreshOutcome, Never> { [weak self] in
+            guard let self else { return .noAnswer }
             return await self.performRefresh()
         }
         refreshInFlight = task
-        let ok = await task.value
+        let outcome = await task.value
         refreshInFlight = nil
-        return ok
+        return outcome
     }
 
-    private func performRefresh() async -> Bool {
-        guard let stored = keychain.getString(for: .refreshToken) else { return false }
+    private func performRefresh() async -> RefreshOutcome {
+        let stored: String
+        switch keychain.read(.refreshToken) {
+        case .found(let value): stored = value
+        case .notFound: return .of(.noRefreshToken)
+        case .unreadable: return .of(.keychainUnreadable)
+        }
+        // Held across the whole rotation (the response and both writes), so iOS
+        // cannot suspend the app holding the lock below or holding a consumed
+        // token it has not saved.
+        let assertion = await MainActor.run { UIApplication.shared.beginBackgroundTask(withName: "token-refresh") }
+        defer {
+            if assertion != .invalid { Task { @MainActor in UIApplication.shared.endBackgroundTask(assertion) } }
+        }
+        // ONE refresh at a time across this app and its notification extension
+        // (`AppGroupLock.refresh()`): two refreshes from the same stored token
+        // retire one of the two pairs, and presenting the retired one later
+        // revokes the session. Under the lock the stored token is read again:
+        // changed means the extension refreshed meanwhile, its pair is ours,
+        // and nothing is refreshed here.
+        let lock = AppGroupLock.refresh()
+        let held = await lock?.acquire(timeout: AppGroupLock.appWait)
+        defer { held?.release() }
+        if lock != nil, held == nil { return .of(.lockWaitRanOut) }
+        if SessionRefresh.anotherProcessRefreshed(before: stored, now: keychain.getString(for: .refreshToken)),
+           keychain.getString(for: .accessToken)?.isEmpty == false {
+            await MainActor.run {
+                NotificationCenter.default.post(name: .pingolinAccessTokenRefreshed, object: nil)
+            }
+            return .of(.stored)
+        }
         do {
             let pair = try await refreshToken(stored)
-            try keychain.save(pair.accessToken, for: .accessToken)
-            if let newRefresh = pair.refreshToken {
-                try keychain.save(newRefresh, for: .refreshToken)
-            }
+            // Still the session this refresh was made from? A sign-out
+            // (deleteAll) or another sign-in meanwhile, neither of which takes
+            // this lock: its items are not restored or overwritten with this
+            // pair, and the pair is not used, as in the extension
+            // (`ExtensionSessionRefresh`). An update only: an item that is
+            // gone stays gone.
+            guard keychain.getString(for: .refreshToken) == stored,
+                  keychain.updateRefreshedPair(access: pair.accessToken, refresh: pair.refreshToken)
+            else { return .of(.sessionChanged) }
             // The web shell holds a copy of the access token as a cookie; tell
             // it to take the new one.
             await MainActor.run {
                 NotificationCenter.default.post(name: .pingolinAccessTokenRefreshed, object: nil)
             }
-            return true
+            return .of(.stored)
         } catch let err as APIError {
             #if DEBUG
             print("[Note] refreshToken: failed code=\(err.code) server=\"\(err.message)\"")
             #endif
-            return false
+            return .of(RefreshOutcome.attempt(failedWith: err))
         } catch {
             #if DEBUG
             print("[Note] refreshToken: failed err=\(error)")
             #endif
-            return false
+            return .of(.noResponse)
         }
+    }
+}
+
+/// What a refresh of the session came to. Only `.refused` ends a session
+/// (note-android's rule, as of its refresh-before-the-first-load change).
+enum RefreshOutcome: Equatable {
+    /// A fresh access token is stored: this refresh stored it, another
+    /// process's refresh did, or (`refreshAccessTokenIfExpiring`) the stored
+    /// one still had the time asked for.
+    case refreshed
+    /// The session is over: the auth server refused it, with a JSON 401 from
+    /// `/api/v1/auth/refresh`, or there is no refresh token at all to present.
+    case refused
+    /// Nothing was learnt about the session: no network, a timeout, a 5xx or a
+    /// 429, a 400/401/403 that isn't the auth server's JSON 401 (it never sends
+    /// 400 or 403 there), a Keychain not readable yet, or the refresh lock's
+    /// wait running out. The session is kept.
+    case noAnswer
+
+    /// How one refresh attempt ended, before it is read as an outcome.
+    enum Attempt: Equatable {
+        /// A new pair is stored, by this refresh or by another process's.
+        case stored
+        /// errSecItemNotFound: no refresh token is stored to present.
+        case noRefreshToken
+        /// The Keychain answered with another status (locked before the first
+        /// unlock, say): the token may well be there.
+        case keychainUnreadable
+        case lockWaitRanOut
+        /// The stored session changed while the refresh was out (a sign-out,
+        /// another sign-in): its pair is dropped; nothing was learnt about the
+        /// session there now.
+        case sessionChanged
+        /// The refresh route answered outside 2xx.
+        case answered(status: Int, json: Bool)
+        /// No HTTP answer to read: offline, a timeout, a cancelled task, or a
+        /// failure on this side.
+        case noResponse
+    }
+
+    /// The table (`RefreshOutcomeTests`).
+    static func of(_ attempt: Attempt) -> RefreshOutcome {
+        switch attempt {
+        case .stored:
+            return .refreshed
+        case .noRefreshToken, .answered(status: 401, json: true):
+            return .refused
+        case .keychainUnreadable, .lockWaitRanOut, .sessionChanged, .answered, .noResponse:
+            return .noAnswer
+        }
+    }
+
+    /// The attempt a failed refresh call stands for.
+    static func attempt(failedWith error: APIError) -> Attempt {
+        guard let status = error.status else { return .noResponse }
+        return .answered(status: status, json: error.isJSON == true)
     }
 }
 
@@ -882,6 +1057,14 @@ struct APIError: Codable, LocalizedError {
     /// caller match on the canonical `resource` (e.g. `attachment_bytes`)
     /// rather than only the `code` string.
     var quota: QuotaErrorInfo? = nil
+    /// Whether the HTTP answer said it was JSON (`Content-Type:
+    /// application/json`); nil when this didn't come from an HTTP answer.
+    var isJSON: Bool? = nil
+
+    /// A request whose 401 sent the session to be refreshed, when the refresh
+    /// got no answer (`RefreshOutcome.noAnswer`): a network failure, never a
+    /// 401, so nothing ends the session over it.
+    static let refreshNoAnswer = APIError(code: "refresh_no_answer", message: "The session refresh got no answer")
 
     /// What `.localizedDescription` shows: `plainLine`, never `message`.
     ///
@@ -922,6 +1105,7 @@ struct APIError: Codable, LocalizedError {
     /// The failures this app raises itself, in its own words.
     private static let lines: [String: String] = [
         "network_error": unreachableText,
+        "refresh_no_answer": unreachableText,
     ]
 
     /// A create whose client-supplied id already exists. Only reachable when

@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Pingolin Note. If not, see <https://www.gnu.org/licenses/>.
 
+import CryptoKit
 import SwiftUI
 import WebKit
 
@@ -77,14 +78,33 @@ final class WebShellModel: NSObject, ObservableObject {
 
     private var origin: String { AppConfiguration.shared.webBaseURL }
 
+    /// Starts the session's refresh at the first foreground signal.
+    private var foregroundRefresh: ForegroundRefreshTrigger?
+    /// Refreshes a stale session when the network is back, and every 30 s
+    /// while it stays stale in the foreground.
+    private var catchUp: SessionCatchUp?
+    /// The token the page was last given (a digest), so each new one reaches
+    /// it once.
+    private var seeded = SeededToken()
+
     private override init() {
         super.init()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(reseedCookies),
-            name: UIApplication.willEnterForegroundNotification,
-            object: nil
-        )
+        // Back in the foreground, the session's refresh starts at the FIRST
+        // signal of it, before the app is active (`ForegroundRefreshTrigger`).
+        foregroundRefresh = ForegroundRefreshTrigger { [weak self] in self?.startForegroundRefresh() }
+        catchUp = SessionCatchUp(hooks: .init(
+            isStale: { SessionCatchUp.isStale(KeychainService.shared.getString(for: .accessToken)) },
+            isForeground: { MainActor.assumeIsolated { UIApplication.shared.applicationState != .background } },
+            expiry: { KeychainService.shared.getString(for: .accessToken).flatMap(APIService.accessTokenExpiry) },
+            now: { Date() },
+            stamp: { AuthManager.SessionStamp.current() },
+            refresh: { await APIService.shared.refreshAccessTokenIfExpiring(within: 120) },
+            reseed: { [weak self] in await self?.reseedIfBehind() },
+            refused: { stamp in
+                MainActor.assumeIsolated { AuthManager.shared.expireSessionRefusedByServer(since: stamp) }
+            },
+            schedule: SessionCatchUp.mainRunLoopOnce
+        ))
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(refreshDeviceSnapshot),
@@ -191,8 +211,7 @@ final class WebShellModel: NSObject, ObservableObject {
         pageReady = false
         Task { @MainActor [weak self] in
             await self?.removeServiceWorkersOnce()
-            await self?.seedCookies()
-            self?.loadHome()
+            await self?.holdFirstLoadForTheLaunchRefresh()
         }
         return web
     }
@@ -276,6 +295,9 @@ final class WebShellModel: NSObject, ObservableObject {
         pendingPath = nil
         tokenRefreshTimer?.invalidate()
         tokenRefreshTimer = nil
+        catchUp?.stop()
+        seeded.forget()
+        seeding = nil
         if !keepData { WebShellDataStore.wipe() }
     }
 
@@ -325,11 +347,46 @@ final class WebShellModel: NSObject, ObservableObject {
     /// APIService refreshes on a 401 — and re-seeds the short-lived access
     /// token. Any `refresh_token` cookie in the store (an earlier build's, or
     /// one the portal set during an in-shell sign-in) is deleted.
+    ///
+    /// `refreshFirst: false` when the caller has already settled the refresh
+    /// (the first load, the foreground). `keepExpired` seeds an expired token
+    /// too: the first load never goes out with NO cookie while a session is
+    /// stored (`cookieLifetime`).
     @MainActor
-    func seedCookies() async {
-        await APIService.shared.refreshAccessTokenIfExpiring(within: 120)
+    func seedCookies(refreshFirst: Bool = true, keepExpired: Bool = false) async {
+        if refreshFirst { await APIService.shared.refreshAccessTokenIfExpiring(within: 120) }
+        // One seed at a time, in the order asked. Each reads the Keychain's
+        // token when its turn comes, so the last one seeded is the newest, and
+        // a slow seed can't land an older token after a newer one, or empty
+        // the jar under it.
+        let previous = seeding
+        let mine = Task { @MainActor [weak self] in
+            // A seed stuck on the cookie store holds the next one back at most
+            // `seedQueueWait`, and none past a sign-out (teardown lets go).
+            if let previous {
+                _ = await WebShellModel.settled(within: WebShellModel.seedQueueWait) { await previous.value }
+            }
+            await self?.seedNow(keepExpired: keepExpired)
+        }
+        seeding = mine
+        await mine.value
+    }
+
+    /// The seed in progress, which the next one waits for (`seedCookies`).
+    private var seeding: Task<Void, Never>?
+    /// How long a seed waits for the one before it.
+    static let seedQueueWait: Double = 5
+
+    /// The one seed whose turn it is.
+    @MainActor
+    private func seedNow(keepExpired: Bool) async {
+        // However this ends, a token still stale keeps the catch-up retrying
+        // (`SessionCatchUp`); a fresh one stops it.
+        defer { catchUp?.evaluate() }
         guard let access = KeychainService.shared.getString(for: .accessToken),
               let url = URL(string: origin) else { return }
+        // Never an older token over a newer one (by `iat`).
+        guard !seeded.isOlder(access) else { return }
         let dataStore = WebShellDataStore.store()
         if !cookieJarReset {
             await Self.resetCookieJar(dataStore)
@@ -340,13 +397,112 @@ final class WebShellModel: NSObject, ObservableObject {
             await store.deleteCookie(cookie)
         }
         let expiry = APIService.accessTokenExpiry(access)
-        let lifetime = expiry.map { Int($0.timeIntervalSinceNow) } ?? Self.authCookieFallbackMaxAge
-        guard lifetime > 0,
+        guard let lifetime = Self.cookieLifetime(expiry: expiry, keepExpired: keepExpired),
               let cookie = Self.authCookie(token: access, domain: Self.cookieDomain(for: origin),
                                            url: url, maxAge: lifetime)
         else { return }
         await store.setCookie(cookie)
+        // A seed held past `seedQueueWait` can finish after a newer one. If a
+        // newer token was recorded meanwhile, this one has just written over
+        // it: the Keychain's token is seeded again.
+        guard !seeded.isOlder(access) else {
+            Task { @MainActor [weak self] in await self?.seedCookies(refreshFirst: false) }
+            return
+        }
+        seeded.record(access)
         scheduleTokenRefresh(before: expiry)
+    }
+
+    /// The page's copy follows the Keychain's token: re-seeded when the token
+    /// there is newer than the one the page was last given, once per token.
+    @MainActor
+    func reseedIfBehind() async {
+        guard webView != nil, seeded.isBehind(KeychainService.shared.getString(for: .accessToken)) else { return }
+        await seedCookies(refreshFirst: false)
+    }
+
+    /// The cookie's Max-Age: the token's own remaining life; the fallback when
+    /// its expiry can't be read, or when an expired token is kept
+    /// (`keepExpired`; the next refresh re-seeds it). nil, no cookie, for an
+    /// expired token otherwise.
+    static func cookieLifetime(expiry: Date?, keepExpired: Bool, now: Date = Date()) -> Int? {
+        guard let expiry else { return authCookieFallbackMaxAge }
+        let left = Int(expiry.timeIntervalSince(now))
+        if left > 0 { return left }
+        return keepExpired ? authCookieFallbackMaxAge : nil
+    }
+
+    /// How long the first load waits for the launch's refresh, and the pause
+    /// before that refresh's one retry.
+    static let firstLoadWait: Double = 5
+    static let firstLoadRetryPause: Double = 0.5
+
+    /// The first load waits for the launch's refresh to settle, as the
+    /// Android shell does: the page asks `/auth/me` with the cookie it is
+    /// given, and a dead copy of the access token there reads as a sign-out.
+    @MainActor
+    func holdFirstLoadForTheLaunchRefresh() async {
+        let stamp = AuthManager.SessionStamp.current()
+        await Self.firstLoad(
+            wait: Self.firstLoadWait,
+            refresh: { await APIService.shared.refreshAccessTokenIfExpiring(within: 120) },
+            refused: { AuthManager.shared.expireSessionRefusedByServer(since: stamp) },
+            seed: { [weak self] in await self?.seedCookies(refreshFirst: false, keepExpired: true) },
+            load: { [weak self] in self?.loadHome() }
+        )
+    }
+
+    /// The first load against the launch's refresh, at most `wait`.
+    /// Refreshed: seed, then load. Refused: the session is over; nothing loads
+    /// and the person signs in natively (a refusal that ends nothing, for a
+    /// session no longer the one stored, loads as for no answer). No answer:
+    /// one retry within the wait, then the stored token is seeded even if
+    /// expired (never NO cookie while a session is stored) and the page loads.
+    /// A refresh still running when the wait ends is let run: cut short, it
+    /// could leave its rotated pair unsaved; when it lands, its notification
+    /// re-seeds the page.
+    @MainActor
+    static func firstLoad(wait: Double, retryPause: Double = firstLoadRetryPause,
+                          refresh: @escaping () async -> RefreshOutcome,
+                          refused: () -> Bool,
+                          seed: () async -> Void,
+                          load: () -> Void) async {
+        let outcome = await settled(within: wait) { () async -> RefreshOutcome in
+            let first = await refresh()
+            guard first == .noAnswer else { return first }
+            try? await Task.sleep(for: .seconds(retryPause))
+            return await refresh()
+        } ?? .noAnswer
+        if outcome == .refused, refused() { return }
+        await seed()
+        load()
+    }
+
+    /// `work`'s answer, or nil once `seconds` have passed, whichever is first.
+    /// `work` is never cancelled (see `bounded`).
+    static func settled<T>(within seconds: Double, _ work: @escaping () async -> T) async -> T? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+            let once = FirstAnswer(continuation)
+            Task { once.resume(await work()) }
+            Task {
+                try? await Task.sleep(for: .seconds(seconds))
+                once.resume(nil)
+            }
+        }
+    }
+
+    /// Resumes its continuation with the first answer given, once.
+    private final class FirstAnswer<T>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<T?, Never>?
+        init(_ continuation: CheckedContinuation<T?, Never>) { self.continuation = continuation }
+        func resume(_ value: T?) {
+            lock.lock()
+            let c = continuation
+            continuation = nil
+            lock.unlock()
+            c?.resume(returning: value)
+        }
     }
 
     /// Whether this launch has emptied the page's cookie jar yet.
@@ -399,13 +555,51 @@ final class WebShellModel: NSObject, ObservableObject {
         tokenRefreshTimer = timer
     }
 
-    /// A foregrounded shell may have sat in the switcher past the access
-    /// token's TTL; refreshing natively and re-seeding saves the page a 401 —
-    /// which would otherwise read as a sign-out. Also run when APIService
-    /// refreshed the token on its own.
+    /// APIService refreshed the token (on a 401 elsewhere, or for the
+    /// foreground): the page's copy follows.
     @objc private func reseedCookies() {
         guard webView != nil else { return }
-        Task { @MainActor in await seedCookies() }
+        Task { @MainActor in await reseedIfBehind() }
+    }
+
+    /// A foregrounded shell may have sat in the switcher past the access
+    /// token's TTL, and the page re-checks its session the moment it is
+    /// visible again: a 401 there reads as a sign-out. So the session is
+    /// checked at the first foreground signal (`ForegroundRefreshTrigger`), on
+    /// APIService's actor at once rather than behind the main thread's own
+    /// foreground work: a token near its expiry is refreshed, a fresh one is
+    /// asked about once, so a session revoked elsewhere meanwhile comes back
+    /// refused (`checkSessionOnReturn`). The page's copy is re-seeded once it
+    /// settles.
+    private func startForegroundRefresh() {
+        guard webView != nil else { return }
+        let stamp = AuthManager.SessionStamp.current()
+        let refresh = Task.detached(priority: .userInitiated) {
+            await APIService.shared.checkSessionOnReturn(within: 120)
+        }
+        Task { @MainActor [weak self] in
+            let outcome = await refresh.value
+            await WebShellModel.afterForegroundRefresh(
+                outcome,
+                refused: { AuthManager.shared.expireSessionRefusedByServer(since: stamp) },
+                reseed: { await self?.reseedIfBehind() },
+                evaluate: { self?.catchUp?.evaluate() }
+            )
+        }
+    }
+
+    /// What the foreground does with its check. Refused: the session ended
+    /// while away (it timed out, it was revoked, or every device was signed
+    /// out), so the native sign-in comes at once, as at the first load, before
+    /// the page's visible re-check can wipe and land on the portal. Otherwise,
+    /// and for a refusal that ends nothing (a session no longer the one
+    /// stored), the page's copy follows and the catch-up looks again.
+    @MainActor
+    static func afterForegroundRefresh(_ outcome: RefreshOutcome, refused: () -> Bool,
+                                       reseed: () async -> Void, evaluate: () -> Void) async {
+        if outcome == .refused, refused() { return }
+        await reseed()
+        evaluate()
     }
 
     /// Used only if a token's `exp` cannot be read: the server's 15-minute
@@ -1064,4 +1258,225 @@ private struct WebShellContainer: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
+}
+
+/// Fires at the FIRST signal that the app is coming back to the foreground: a
+/// scene's `willEnterForeground` or the application's, whichever is posted
+/// first, inside that notification. Never later, at `didBecomeActive`: WebKit
+/// shows the page again as the app enters the foreground, and the page
+/// re-checks its session at once. Once per trip; the next background re-arms
+/// it.
+final class ForegroundRefreshTrigger {
+    private let center: NotificationCenter
+    private let fire: () -> Void
+    private var observers: [NSObjectProtocol] = []
+    private var armed = true
+
+    init(center: NotificationCenter = .default, fire: @escaping () -> Void) {
+        self.center = center
+        self.fire = fire
+        for name in [UIScene.willEnterForegroundNotification, UIApplication.willEnterForegroundNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                self?.enteringForeground()
+            })
+        }
+        for name in [UIScene.didEnterBackgroundNotification, UIApplication.didEnterBackgroundNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                self?.armed = true
+            })
+        }
+    }
+
+    deinit {
+        for observer in observers { center.removeObserver(observer) }
+    }
+
+    private func enteringForeground() {
+        guard armed else { return }
+        armed = false
+        fire()
+    }
+}
+
+/// The access token the page was last given, kept as a digest: the shell
+/// holds no second copy of the token itself.
+struct SeededToken {
+    private var digest: SHA256.Digest?
+    private var issuedAt: Date?
+
+    /// Whether `token` is newer than the one last seeded. Any other token is:
+    /// a session's token only moves forward, and a sign-out forgets the last.
+    func isBehind(_ token: String?) -> Bool {
+        guard let token else { return false }
+        return SHA256.hash(data: Data(token.utf8)) != digest
+    }
+
+    /// Whether `token` was issued (`iat`) before the one last seeded: an older
+    /// token never replaces a newer one in the page's jar. Unknown either way:
+    /// not older.
+    func isOlder(_ token: String) -> Bool {
+        guard let issuedAt, let theirs = APIService.accessTokenIssuedAt(token) else { return false }
+        return theirs < issuedAt
+    }
+
+    mutating func record(_ token: String) {
+        digest = SHA256.hash(data: Data(token.utf8))
+        issuedAt = APIService.accessTokenIssuedAt(token)
+    }
+
+    mutating func forget() {
+        digest = nil
+        issuedAt = nil
+    }
+}
+
+/// A stale session catches up. While the stored access token is expired, or
+/// within 120 s of its expiry, the page's copy is dead or about to be; a
+/// refresh that got no answer (offline at launch or at the foreground, the
+/// auth server failing) leaves it so, and nothing else refreshes until some
+/// native request happens to. So when the network comes back, and on a retry
+/// while the token is stale and the app is in the foreground, the one
+/// refresher runs and the page is re-seeded with the new token. The retries
+/// come quickly at first, 1, 2 and 4 s apart, inside the page's own retries
+/// after a 401 (300 ms, 1 s, 2 s), so a passing failure is caught before the
+/// page believes its 401; then every 30 s. They stop once the token is fresh
+/// (the next stale spell starts quick again), on background, and on sign-out
+/// (the shell's teardown). The page's cookie dies with the token: when a
+/// retry would land past the token's expiry, the quick retries start again
+/// there (1, 2 and 4 s after it), as the page's requests then go out with no
+/// cookie. A refused session gets the usual sign-out, for the session the
+/// attempt started under, and nothing else; a refusal that sign-out drops (a
+/// sign-out or erasure under way, another session meanwhile) keeps the
+/// retries going.
+///
+/// Used on the main thread: the observers run where the notification is
+/// posted (UIKit's and the connectivity monitor's are on the main thread), and
+/// the timers are on the main run loop.
+final class SessionCatchUp {
+    struct Hooks {
+        var isStale: () -> Bool
+        var isForeground: () -> Bool
+        /// The stored token's expiry, when it can be read.
+        var expiry: () -> Date?
+        var now: () -> Date
+        /// The session an attempt starts under, handed back with its refusal.
+        var stamp: () -> AuthManager.SessionStamp
+        var refresh: () async -> RefreshOutcome
+        var reseed: () async -> Void
+        /// Ends the session the attempt started under; answers whether it did.
+        var refused: (AuthManager.SessionStamp) -> Bool
+        /// Runs `fire` once after `delay`; returns what cancels it.
+        var schedule: (_ delay: TimeInterval, _ fire: @escaping () -> Void) -> () -> Void
+    }
+
+    /// The first retries of a stale spell, then `retryEvery`.
+    static let quickRetries: [TimeInterval] = [1, 2, 4]
+    static let retryEvery: TimeInterval = 30
+
+    private let hooks: Hooks
+    private let center: NotificationCenter
+    private var observers: [NSObjectProtocol] = []
+    private var cancelPending: (() -> Void)?
+    private var retriesSoFar = 0
+    private var attempting = false
+
+    /// Whether a retry is pending or an attempt is out.
+    var isRetrying: Bool { cancelPending != nil || attempting }
+
+    init(center: NotificationCenter = .default, hooks: Hooks) {
+        self.center = center
+        self.hooks = hooks
+        observers.append(center.addObserver(forName: .pingolinNetworkRegained, object: nil, queue: nil) { [weak self] _ in
+            self?.networkRegained()
+        })
+        for name in [UIScene.didEnterBackgroundNotification, UIApplication.didEnterBackgroundNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                self?.stop()
+            })
+        }
+    }
+
+    deinit {
+        for observer in observers { center.removeObserver(observer) }
+        cancelPending?()
+    }
+
+    /// After every seed, and once an attempt settles: a retry is pending
+    /// exactly while the token is stale and the app is in the foreground.
+    func evaluate() {
+        guard hooks.isStale(), hooks.isForeground() else { return stop() }
+        guard cancelPending == nil, !attempting else { return }
+        var delay = retriesSoFar < Self.quickRetries.count ? Self.quickRetries[retriesSoFar] : Self.retryEvery
+        retriesSoFar += 1
+        // The page's cookie dies at the token's expiry, and its requests then
+        // go out with none: a retry that would land past it is brought to it,
+        // and the quick retries start again from there.
+        let now = hooks.now()
+        if let expiry = hooks.expiry(), now < expiry, now.addingTimeInterval(delay) > expiry {
+            delay = expiry.timeIntervalSince(now) + Self.quickRetries[0]
+            retriesSoFar = 1
+        }
+        cancelPending = hooks.schedule(delay) { [weak self] in
+            self?.cancelPending = nil
+            self?.retry()
+        }
+    }
+
+    /// Fresh, in the background, or signed out: nothing pending, and the next
+    /// stale spell starts with the quick retries again.
+    func stop() {
+        cancelPending?()
+        cancelPending = nil
+        retriesSoFar = 0
+    }
+
+    /// The network came back: a stale session catches up at once.
+    func networkRegained() {
+        if hooks.isStale() { attempt() }
+    }
+
+    func retry() {
+        guard hooks.isStale(), hooks.isForeground() else { return stop() }
+        attempt()
+    }
+
+    /// One attempt at a time, through the one refresher.
+    private func attempt() {
+        guard !attempting else { return }
+        attempting = true
+        cancelPending?()
+        cancelPending = nil
+        let stamp = hooks.stamp()
+        let hooks = self.hooks
+        Task { @MainActor [weak self] in
+            let outcome = await hooks.refresh()
+            self?.attempting = false
+            switch outcome {
+            case .refreshed:
+                await hooks.reseed()
+                self?.evaluate()
+            case .refused:
+                // Judged first: a refusal the sign-out drops keeps the
+                // retries going, as for no answer.
+                if hooks.refused(stamp) { self?.stop() } else { self?.evaluate() }
+            case .noAnswer:
+                self?.evaluate()
+            }
+        }
+    }
+
+    /// Whether a stored access token is expired or within `margin` of its
+    /// expiry. None, or one whose expiry can't be read, is not stale here:
+    /// there is nothing to catch up, and the 401 paths see to the rest.
+    static func isStale(_ token: String?, now: Date = Date(), margin: TimeInterval = 120) -> Bool {
+        guard let token, let expiry = APIService.accessTokenExpiry(token) else { return false }
+        return expiry.timeIntervalSince(now) <= margin
+    }
+
+    /// The real scheduler: once, on the main run loop, in every mode.
+    static func mainRunLoopOnce(after delay: TimeInterval, fire: @escaping () -> Void) -> () -> Void {
+        let timer = Timer(timeInterval: delay, repeats: false) { _ in fire() }
+        RunLoop.main.add(timer, forMode: .common)
+        return { timer.invalidate() }
+    }
 }

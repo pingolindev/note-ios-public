@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the Notification Service Extension: the app's keychain
+  group and its app group, and nothing else.
+
+  KeychainService and the SDK's key store set no explicit kSecAttrAccessGroup,
+  so their items live in the app's default group, the first entry of the app's
+  keychain-access-groups: exactly the group named below. Declaring it here lets
+  the extension read those same items (and update the two session items after
+  a refresh). No migration is needed.
+
+  The items are kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly, so this works
+  on a locked phone after the first unlock since boot; before it, every read
+  fails and nothing is finished.
+
+  The app group holds what the app mirrors for the extension and the stores
+  the two share (FinisherStores.swift).
+-->
+<plist version="1.0">
+<dict>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)com.pingolin.note</string>
+    </array>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.com.pingolin.note</string>
+    </array>
+</dict>
+</plist>

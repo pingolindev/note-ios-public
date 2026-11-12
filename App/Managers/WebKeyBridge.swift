@@ -47,11 +47,30 @@ import PingolinNoteSDK
 ///                                                               | {v: 1, state: 'unreadable'}
 ///   op `keepTrust`         {v: 1, account, pins, floors,
 ///                           owners}                          -> {v: 1, state: 'kept'}
+///   op `takeSeals`         {v: 1, account}                   -> {v: 1, account, state: 'seals',
+///                                                                 seals: [{user_id, sharing_public_key,
+///                                                                          signing_public_key, sealed_at}]}
+///                                                               | {v: 1, account, state: 'none'}
+///                                                               | {v: 1, account, state: 'unreadable'}
+///   op `clearSeals`        {v: 1, account, upTo: ms}         -> {v: 1, account, state: 'cleared'}
 ///
-/// The last two are kept trust (the page's lib/keptTrust.ts, the Android app's
-/// KeptWebTrustChannel): the account is the signed-in one in its one canonical
-/// form or the request is refused, each blob is a string or null, and the
-/// marker's `version` stays 1 — the page leaves bridge mode for anything else.
+/// `keptTrust` and `keepTrust` are kept trust (the page's lib/keptTrust.ts, the
+/// Android app's KeptWebTrustChannel): the account is the signed-in one in its
+/// one canonical form or the request is refused, each blob is a string or null,
+/// and the marker's `version` stays 1 — the page leaves bridge mode for
+/// anything else. `takeSeals` and `clearSeals` hand the page the keys this
+/// phone sealed finished invitations to while the page was not running
+/// (`InvitationFinisher`, `SealStore`): the page folds them into its pins,
+/// keeps, then lets go of them up to the newest it folded. Taking deletes
+/// nothing, and a clear lets go only of the seals the copy of the pins the page
+/// last kept shows folded: their person pinned at the seal's two keys, or a
+/// conflict. Same account rule.
+///
+/// The copy of the page's pins the finisher reads (`KeptPinsMirror`) is only
+/// ever one a keep made after the page's latest adopt: every `keptTrust`,
+/// answered or refused, drops it first (a page whose adopt got no answer in
+/// time sends no keeps that session, and would leave an older copy behind its
+/// own pins), a `keepTrust` that fails drops it, and one that lands writes it.
 ///
 /// A request the bridge cannot serve rejects with one of `Failure`'s messages.
 /// Every op is scoped to what Note needs and no more:
@@ -79,6 +98,11 @@ enum WebKeyBridge {
         /// Kept trust: this account's copy, and keeping one.
         var keptTrust: (String) async -> KeptWebTrustStore.Kept = { _ in .unreadable }
         var keepTrust: (String, String?, String?, String?) async -> Bool = { _, _, _, _ in false }
+        /// The seals: this account's, and letting go of those up to a time (ms).
+        var takeSeals: (String) async -> SealRead = { _ in .unreadable }
+        var clearSeals: (String, Double) async -> Bool = { _, _ in false }
+        /// No copy of this account's pins for the finisher until a keep lands.
+        var dropKeptPins: (String) async -> Void = { _ in }
     }
 
     enum Failure: String, Error {
@@ -90,6 +114,7 @@ enum WebKeyBridge {
         case senderMismatch = "sender mismatch"
         case notThisAccount = "not this account"
         case notKept = "not kept"
+        case notCleared = "not cleared"
     }
 
     static let live = KeySource(
@@ -100,7 +125,14 @@ enum WebKeyBridge {
             await previousVaultKeys(from: .shared, pageAsked: { await IdentityRecheck.shared.pageAsked() })
         },
         keptTrust: { await KeptWebTrustStore.shared.get($0) },
-        keepTrust: { await KeptWebTrustStore.shared.keep($0, pins: $1, floors: $2, owners: $3) }
+        keepTrust: { await KeptWebTrustStore.shared.keep($0, pins: $1, floors: $2, owners: $3) },
+        takeSeals: { SealStore.appGroup()?.read($0) ?? .unreadable },
+        clearSeals: { account, upTo in
+            guard let files = FinisherFiles.appGroup() else { return false }
+            return await SealStore(files: files, lock: AppGroupLock.seals())
+                .clear(account, upTo: upTo, pins: KeptPinsMirror.pins(account, in: files))
+        },
+        dropKeptPins: { await KeptWebTrustStore.shared.dropPinsCopy($0) }
     )
 
     /// The page's op `previousVaultKeys`. The first call of a session is the
@@ -200,16 +232,32 @@ enum WebKeyBridge {
         case "keptTrust", "keepTrust":
             return await keptTrust(op, request, keys: keys)
 
+        case "takeSeals", "clearSeals":
+            return await seals(op, request, keys: keys)
+
         default:
             return .failure(.unknownOp)
         }
     }
 
+    /// Kept trust (the page's keptTrust.ts), and the copy of the pins the
+    /// finisher reads: an adopt drops it before it is answered, whatever the
+    /// answer or the refusal; a keep that is refused or not kept drops it (one
+    /// that is kept has written it).
+    private static func keptTrust(_ op: String, _ request: [String: Any],
+                                  keys: KeySource) async -> Result<[String: Any], Failure> {
+        let signedIn = CanonicalId.of(keys.userId())
+        if op == "keptTrust", let signedIn { await keys.dropKeptPins(signedIn) }
+        let result = await keptTrustAnswer(op, request, keys: keys)
+        if op == "keepTrust", case .failure = result, let signedIn { await keys.dropKeptPins(signedIn) }
+        return result
+    }
+
     /// Kept trust (the page's keptTrust.ts). Only for the signed-in
     /// account, named in its one form in every reply; a refusal is a rejection,
     /// which the page reads as no answer.
-    private static func keptTrust(_ op: String, _ request: [String: Any],
-                                  keys: KeySource) async -> Result<[String: Any], Failure> {
+    private static func keptTrustAnswer(_ op: String, _ request: [String: Any],
+                                        keys: KeySource) async -> Result<[String: Any], Failure> {
         guard let v = request["v"] as? NSNumber, CFGetTypeID(v) != CFBooleanGetTypeID(), v.doubleValue == 1 else {
             return .failure(.invalidRequest)
         }
@@ -237,6 +285,34 @@ enum WebKeyBridge {
         }
         guard await keys.keepTrust(me, blobs[0], blobs[1], blobs[2]) else { return .failure(.notKept) }
         return .success(["v": 1, "state": "kept"])
+    }
+
+    /// The seals (the page's lib/keptTrust.ts `takeShellSeals`). Only for the
+    /// signed-in account, named in its one form in every reply; a refusal is a
+    /// rejection, which the page reads as no answer.
+    private static func seals(_ op: String, _ request: [String: Any],
+                              keys: KeySource) async -> Result<[String: Any], Failure> {
+        guard let v = request["v"] as? NSNumber, CFGetTypeID(v) != CFBooleanGetTypeID(), v.doubleValue == 1 else {
+            return .failure(.invalidRequest)
+        }
+        guard let me = CanonicalId.of(keys.userId()),
+              let asked = request["account"] as? String, CanonicalId.of(asked) == me
+        else { return .failure(.notThisAccount) }
+        if op == "takeSeals" {
+            switch await keys.takeSeals(me) {
+            case .seals(let seals) where !seals.isEmpty:
+                return .success(["v": 1, "account": me, "state": "seals", "seals": seals.map(\.json)])
+            case .seals, .none:
+                return .success(["v": 1, "account": me, "state": "none"])
+            case .unreadable:
+                return .success(["v": 1, "account": me, "state": "unreadable"])
+            }
+        }
+        guard let upTo = request["upTo"] as? NSNumber, CFGetTypeID(upTo) != CFBooleanGetTypeID(),
+              upTo.doubleValue.isFinite, upTo.doubleValue >= 0
+        else { return .failure(.invalidRequest) }
+        guard await keys.clearSeals(me, upTo.doubleValue) else { return .failure(.notCleared) }
+        return .success(["v": 1, "account": me, "state": "cleared"])
     }
 
     /// A JS number that is an integer in 0...UInt32.max (never a boolean).

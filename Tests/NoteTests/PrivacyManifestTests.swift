@@ -46,6 +46,22 @@ final class PrivacyManifestTests: XCTestCase {
         }
     }
 
+    /// The notification extension reads the app group's UserDefaults, and the
+    /// SDK it links (its bundled SQLite) reads file metadata and disk space.
+    func testTheNotificationExtensionCarriesItsOwn() throws {
+        let bundle = try XCTUnwrap(Bundle.main.builtInPlugInsURL?.appendingPathComponent("NotificationExtension.appex"))
+        let declared = try Self.declared(at: bundle.appendingPathComponent("PrivacyInfo.xcprivacy"))
+        XCTAssertEqual(declared, [
+            "NSPrivacyAccessedAPICategoryUserDefaults": ["1C8F.1"],
+            "NSPrivacyAccessedAPICategoryFileTimestamp": ["C617.1"],
+            "NSPrivacyAccessedAPICategoryDiskSpace": ["E174.1"],
+        ])
+        let info = try XCTUnwrap(Bundle(url: bundle)?.infoDictionary)
+        let point = (info["NSExtension"] as? [String: Any])?["NSExtensionPointIdentifier"] as? String
+        XCTAssertEqual(point, "com.apple.usernotifications.service")
+        XCTAssertEqual(Bundle(url: bundle)?.bundleIdentifier, "com.pingolin.note.NotificationExtension")
+    }
+
     /// Each declared API category with its reasons. Every manifest says the
     /// bundle does no tracking.
     private static func declared(at url: URL?) throws -> [String: Set<String>] {

@@ -41,9 +41,17 @@ import UIKit
 ///    never overwritten with less. Before the first unlock `UserDefaults`
 ///    reads as empty, which is never "nothing kept".
 ///  - An account's copy goes when that account is erased on this device.
+///  - The PINS are also copied where the notification extension can read
+///    them (`KeptPinsMirror`, in the app group): whom to trust when it
+///    finishes an invitation is the page's decision (`InvitationFinisher`).
+///    Only a keep that landed after the page's latest adopt makes the copy:
+///    an adopt drops it (`WebKeyBridge`), a keep that lands writes it, and one
+///    that fails drops it, so the copy is never older than the page's pins.
+///    It goes with the kept trust, and so do the extension's seals and
+///    tried-at for the account.
 @MainActor
 final class KeptWebTrustStore {
-    static let shared = KeptWebTrustStore()
+    static let shared = KeptWebTrustStore(mirror: FinisherFiles.appGroup(), sealLock: AppGroupLock.seals())
 
     /// The shell keeps no blob over this (UTF-8 bytes), as the page and note-android.
     nonisolated static let maxBlobBytes = 1024 * 1024
@@ -57,12 +65,18 @@ final class KeptWebTrustStore {
     }
 
     private let defaults: UserDefaults
+    private let mirror: FinisherFiles?
+    /// The lock every change to the seals takes (`SealStore`), held while an
+    /// erasure removes them.
+    private let sealLock: AppGroupLock?
     private let dataReadable: @MainActor () -> Bool
     private let prefix = "note_kept_web_trust."
 
-    init(defaults: UserDefaults = .standard,
+    init(defaults: UserDefaults = .standard, mirror: FinisherFiles? = nil, sealLock: AppGroupLock? = nil,
          dataReadable: @escaping @MainActor () -> Bool = { UIApplication.shared.isProtectedDataAvailable }) {
         self.defaults = defaults
+        self.mirror = mirror
+        self.sealLock = sealLock
         self.dataReadable = dataReadable
     }
 
@@ -77,9 +91,17 @@ final class KeptWebTrustStore {
     }
 
     /// Keep the page's three blobs for this account (a nil drops its blob);
-    /// true when they are stored as given. Nothing over `maxBlobBytes`.
+    /// true when they are stored as given. Nothing over `maxBlobBytes`. The
+    /// pins' copy follows: written when the keep landed, dropped when it did not.
     func keep(_ account: String, pins: String?, floors: String?, owners: String?) -> Bool {
-        guard let id = CanonicalId.of(account), dataReadable() else { return false }
+        guard let id = CanonicalId.of(account) else { return false }
+        let kept = store(id, pins: pins, floors: floors, owners: owners)
+        if kept { mirrorPins(pins, for: id) } else { dropPinsCopy(id) }
+        return kept
+    }
+
+    private func store(_ id: String, pins: String?, floors: String?, owners: String?) -> Bool {
+        guard dataReadable() else { return false }
         var map: [String: String] = [:]
         for (name, blob) in zip(Self.blobNames, [pins, floors, owners]) {
             guard let blob else { continue }
@@ -95,12 +117,33 @@ final class KeptWebTrustStore {
         return (defaults.dictionary(forKey: key) as? [String: String]) == map
     }
 
-    /// Erasure: this account's copy, under every spelling of its id; nobody else's.
+    /// The kept pins where the notification extension reads them; a copy that
+    /// could not be written is removed, and the extension then finishes nothing.
+    private func mirrorPins(_ pins: String?, for id: String) {
+        guard let mirror else { return }
+        if !KeptPinsMirror.write(pins, for: id, in: mirror) { mirror.remove(.keptPins, id) }
+    }
+
+    /// No copy of this account's pins for the extension until the page's next
+    /// keep lands: at the page's adopt, and after a keep that failed.
+    func dropPinsCopy(_ account: String) {
+        guard let id = CanonicalId.of(account) else { return }
+        mirror?.remove(.keptPins, id)
+    }
+
+    /// Erasure: this account's copy, under every spelling of its id, and the
+    /// finisher's stores of it (the pins' copy, its seals, its tried-at);
+    /// nobody else's. They go holding the seal lock, so a seal the extension
+    /// is writing lands first and goes too; if the lock cannot be had in time,
+    /// they go without it: nothing stops an erasure.
     func forget(_ account: String) {
         guard let id = CanonicalId.of(account) else { return }
         for key in defaults.dictionaryRepresentation().keys
         where key.hasPrefix(prefix) && CanonicalId.of(String(key.dropFirst(prefix.count))) == id {
             defaults.removeObject(forKey: key)
         }
+        let held = sealLock?.acquireBlocking(timeout: 2)
+        mirror?.forget(id)
+        held?.release()
     }
 }

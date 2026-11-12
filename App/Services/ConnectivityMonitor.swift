@@ -46,6 +46,11 @@ final class ConnectivityMonitor: ObservableObject {
                 guard let self else { return }
                 let wasOnline = self.isOnline
                 self.isOnline = satisfied
+                // Back online: a stale web-shell session catches up at once
+                // (`SessionCatchUp`; it does nothing for a fresh one).
+                if satisfied, !wasOnline {
+                    NotificationCenter.default.post(name: .pingolinNetworkRegained, object: nil)
+                }
                 // Expedited flush on a regain (offline → online). Gated on an
                 // authenticated session; the sync itself coalesces with any
                 // launch / foreground sync already running (SyncService.isSyncing).
@@ -56,4 +61,9 @@ final class ConnectivityMonitor: ObservableObject {
         }
         monitor.start(queue: queue)
     }
+}
+
+extension Notification.Name {
+    /// The network path became satisfied again (offline to online).
+    static let pingolinNetworkRegained = Notification.Name("pingolinNetworkRegained")
 }

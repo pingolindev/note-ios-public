@@ -212,6 +212,27 @@ final class KeychainService {
         return data
     }
 
+    /// A refreshed session over the two items the app created, written by the
+    /// notification extension (`ExtensionSessionRefresh`): an UPDATE only, so
+    /// the extension never creates a session. The refresh token first: it is
+    /// the one that recovers the session if the access token's write fails.
+    func updateRefreshedPair(access: String, refresh: String?) -> Bool {
+        func update(_ key: Key, _ value: String) -> Bool {
+            let identity: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: key.rawValue
+            ]
+            let attributes: [String: Any] = [
+                kSecValueData as String: Data(value.utf8),
+                kSecAttrAccessible as String: key.accessibility
+            ]
+            return SecItemUpdate(identity as CFDictionary, attributes as CFDictionary) == errSecSuccess
+        }
+        if let refresh, !refresh.isEmpty, refresh != "none", !update(.refreshToken, refresh) { return false }
+        return update(.accessToken, access)
+    }
+
     func delete(key: Key) {
         delete(for: key.rawValue)
     }

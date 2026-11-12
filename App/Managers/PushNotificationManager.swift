@@ -150,6 +150,10 @@ final class PushNotificationManager: NSObject, ObservableObject {
         case sync
         /// A restore was made elsewhere; re-check the earlier identities.
         case identities
+        /// Someone this owner invited has signed up: finish the shares the
+        /// invitation left (`InvitationFinisher`). On iOS it is a visible
+        /// alert, which the notification extension handles first.
+        case finishShares
         case reminder
         case ignored
     }
@@ -163,10 +167,15 @@ final class PushNotificationManager: NSObject, ObservableObject {
         case "notebook_share": return .notebookShare(refId: refId)
         case "sync": return .sync
         case "identities": return .identities
+        case .some(FinishPush.kind): return .finishShares
         case "reminder", "tickle": return .reminder
         default: return .ignored
         }
     }
+
+    /// A background push must be answered within about 30 seconds: the sync
+    /// and the finishing pass after it share this much.
+    static let backgroundPushSeconds: TimeInterval = 25
 
     /// Inspect a push payload and dispatch. Returns a UIBackgroundFetchResult
     /// the PushAppDelegate forwards to the system.
@@ -194,7 +203,17 @@ final class PushNotificationManager: NSObject, ObservableObject {
             // burst of these never piles up — as Android's unique immediate work
             // with KEEP. A background push gets about 30 seconds, so this waits
             // at most 25; the sync itself carries on.
-            await Self.run({ await SyncService.shared.sync() }, waitingAtMost: 25)
+            let start = Date()
+            await Self.run({ await SyncService.shared.sync() }, waitingAtMost: Self.backgroundPushSeconds)
+            // With what is left of those 25 seconds, finish the shares an
+            // invitation left: a claim also sends this push, and the alert's
+            // extension may not have run (InAppFinisher).
+            await InAppFinisher.runAfterSync(startedAt: start, seconds: Self.backgroundPushSeconds)
+            return .newData
+        case .finishShares:
+            // The alert reached the running app. The extension ran for it too;
+            // whatever it left (or could not do) is tried here.
+            await Self.run({ _ = await InAppFinisher.run(until: Date().addingTimeInterval(20)) }, waitingAtMost: 22)
             return .newData
         case .identities:
             // Nothing is read from the push. The re-check is the normal
@@ -316,6 +335,11 @@ extension PushNotificationManager: UNUserNotificationCenterDelegate {
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
+        // A `finish_shares` alert while the app runs: the extension has already
+        // rewritten it; what it left (or could not do) is tried here too.
+        if Self.event(from: notification.request.content.userInfo) == .finishShares {
+            Task { @MainActor in _ = await InAppFinisher.run(until: Date().addingTimeInterval(20)) }
+        }
         completionHandler([.banner, .sound, .badge])
     }
 
